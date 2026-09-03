@@ -20,11 +20,18 @@ get_raw_hex() {
 
 ensure_foot_include() {
   mkdir -p "$FOOT_CONFIG_DIR"
+  local abs_theme="$THEME_FILE"
+
   if [ ! -f "$FOOT_CONF" ]; then
-    echo "include=current-theme.ini" > "$FOOT_CONF"
-  elif ! grep -Eq 'include[[:space:]]*=[[:space:]]*(.+/)?current-theme\.ini' "$FOOT_CONF"; then
-    # Add include at the top or bottom of foot.ini
-    printf "\n# Added by voxr\ninclude=current-theme.ini\n" >> "$FOOT_CONF"
+    echo "include=$abs_theme" > "$FOOT_CONF"
+    return 0
+  fi
+
+  # If foot.ini has the relative include=current-theme.ini, replace it with the absolute path
+  if grep -Eq '^[[:space:]]*include[[:space:]]*=[[:space:]]*(\./)?current-theme\.ini' "$FOOT_CONF"; then
+    sed -i -E "s|^[[:space:]]*include[[:space:]]*=[[:space:]]*(\./)?current-theme\.ini|include=$abs_theme|" "$FOOT_CONF"
+  elif ! grep -Fq "include=$abs_theme" "$FOOT_CONF"; then
+    printf "\n# Added by voxr\ninclude=%s\n" "$abs_theme" >> "$FOOT_CONF"
   fi
 }
 

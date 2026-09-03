@@ -20,9 +20,42 @@ get_hex() {
 ensure_alacritty_include() {
   mkdir -p "$ALACRITTY_CONFIG_DIR"
   if [ ! -f "$ALACRITTY_CONF" ]; then
-    echo 'import = ["current-theme.toml"]' > "$ALACRITTY_CONF"
-  elif ! grep -Eq 'current-theme\.toml' "$ALACRITTY_CONF"; then
-    printf "\n# Added by voxr\nimport = [\"current-theme.toml\"]\n" >> "$ALACRITTY_CONF"
+    cat > "$ALACRITTY_CONF" <<'EOF'
+[general]
+import = ["current-theme.toml"]
+EOF
+    return 0
+  fi
+
+  # Check if current-theme.toml is already referenced
+  if grep -Eq 'current-theme\.toml' "$ALACRITTY_CONF"; then
+    # If using deprecated top-level import = ["current-theme.toml"]
+    if grep -Eq '^[[:space:]]*import[[:space:]]*=[[:space:]]*\[[[:space:]]*"current-theme\.toml"[[:space:]]*\]' "$ALACRITTY_CONF"; then
+      if grep -Eq '^[[:space:]]*\[general\]' "$ALACRITTY_CONF"; then
+        # [general] exists elsewhere, delete deprecated top-level line and insert under [general]
+        sed -i -E '/^[[:space:]]*import[[:space:]]*=[[:space:]]*\[[[:space:]]*"current-theme\.toml"[[:space:]]*\]/d' "$ALACRITTY_CONF"
+        if ! grep -Eq '^[[:space:]]*import[[:space:]]*=.*current-theme\.toml' "$ALACRITTY_CONF"; then
+          sed -i -E '/^[[:space:]]*\[general\]/a import = ["current-theme.toml"]' "$ALACRITTY_CONF"
+        fi
+      else
+        # Replace deprecated line in-place with [general] section
+        sed -i -E 's/^[[:space:]]*import[[:space:]]*=[[:space:]]*\[[[:space:]]*"current-theme\.toml"[[:space:]]*\]/[general]\nimport = ["current-theme.toml"]/' "$ALACRITTY_CONF"
+      fi
+    fi
+    return 0
+  fi
+
+  # current-theme.toml is not yet in config
+  if grep -Eq '^[[:space:]]*\[general\]' "$ALACRITTY_CONF"; then
+    # Insert import right after [general]
+    sed -i -E '/^[[:space:]]*\[general\]/a import = ["current-theme.toml"]' "$ALACRITTY_CONF"
+  else
+    # Prepend [general] table at top of file
+    local tmp
+    tmp="$(mktemp)"
+    printf '[general]\nimport = ["current-theme.toml"]\n\n' > "$tmp"
+    cat "$ALACRITTY_CONF" >> "$tmp"
+    mv "$tmp" "$ALACRITTY_CONF"
   fi
 }
 
