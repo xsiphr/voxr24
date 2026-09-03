@@ -1,0 +1,19 @@
+pkgbase = voxr-git
+	pkgdesc = A unified terminal aesthetics manager (system-info fetch layout + terminal colorscheme)
+	pkgver = 1.1.0
+	pkgrel = 1
+	url = https://github.com/xsiphr/voxr24
+	arch = any
+	license = MIT
+	depends = bash
+	depends = fastfetch
+	optdepends = kitty: for Kitty terminal color switching support
+	optdepends = alacritty: for Alacritty terminal color switching support
+	optdepends = ghostty: for Ghostty terminal color switching support
+	optdepends = foot: for Foot terminal color switching support
+	provides = voxr
+	conflicts = voxr
+	source = git+https://github.com/xsiphr/voxr24.git
+	sha256sums = SKIP
+
+pkgname = voxr-git

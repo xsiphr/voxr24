@@ -1,0 +1,767 @@
+#!/usr/bin/env bash
+#
+# voxr - Unified Terminal Aesthetics Manager
+# Manages system-info display layouts & terminal color themes independently.
+# Repo: voxr24 (https://github.com/xsiphr/voxr24)
+#
+
+set -euo pipefail
+
+VERSION="1.1.0"
+
+# Terminal styling
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  BOLD="\033[1m"
+  DIM="\033[2m"
+  RED="\033[0;31m"
+  GREEN="\033[0;32m"
+  YELLOW="\033[0;33m"
+  BLUE="\033[0;34m"
+  MAGENTA="\033[0;35m"
+  CYAN="\033[0;36m"
+  NC="\033[0m"
+else
+  BOLD=""
+  DIM=""
+  RED=""
+  GREEN=""
+  YELLOW=""
+  BLUE=""
+  MAGENTA=""
+  CYAN=""
+  NC=""
+fi
+
+# Resolve script path safely through symlinks
+resolve_voxr_dir() {
+  local source="${BASH_SOURCE[0]}"
+  while [ -h "$source" ]; do
+    local dir
+    dir="$(cd -P "$(dirname "$source")" && pwd)"
+    source="$(readlink "$source")"
+    [[ $source != /* ]] && source="$dir/$source"
+  done
+  cd -P "$(dirname "$source")" && pwd
+}
+
+SCRIPT_REALDIR="$(resolve_voxr_dir)"
+
+# Dual-path asset discovery: local repository mode vs system-wide installation
+if [ -d "$SCRIPT_REALDIR/fetchers" ] && [ -d "$SCRIPT_REALDIR/colorschemes" ]; then
+  VOXR_DATA_DIR="$SCRIPT_REALDIR"
+elif [ -d "/usr/share/voxr/fetchers" ] && [ -d "/usr/share/voxr/colorschemes" ]; then
+  VOXR_DATA_DIR="/usr/share/voxr"
+elif [ -d "/usr/local/share/voxr/fetchers" ] && [ -d "/usr/local/share/voxr/colorschemes" ]; then
+  VOXR_DATA_DIR="/usr/local/share/voxr"
+elif [ -n "${VOXR_DATA_DIR:-}" ] && [ -d "$VOXR_DATA_DIR/fetchers" ]; then
+  # Explicit environment override
+  :
+else
+  echo -e "${RED}Error:${NC} voxr assets could not be found." >&2
+  echo "Searched locations:" >&2
+  echo "  - $SCRIPT_REALDIR" >&2
+  echo "  - /usr/share/voxr" >&2
+  echo "  - /usr/local/share/voxr" >&2
+  exit 1
+fi
+
+FETCHERS_DIR="$VOXR_DATA_DIR/fetchers"
+COLORSCHEMES_DIR="$VOXR_DATA_DIR/colorschemes"
+ADAPTERS_DIR="$VOXR_DATA_DIR/adapters"
+PRESETS_DIR="$VOXR_DATA_DIR/presets"
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+FASTFETCH_CONFIG_DIR="$CONFIG_HOME/fastfetch"
+FASTFETCH_LIVE_CONFIG="$FASTFETCH_CONFIG_DIR/config.jsonc"
+VOXR_BACKUP_DIR="$CONFIG_HOME/voxr/backups"
+
+ACTIVE_TERMINAL=""
+
+detect_terminal() {
+  local detected=""
+
+  # 1. Check emulator-specific environment variables
+  if [ -n "${KITTY_PID:-}" ] || [ -n "${KITTY_WINDOW_ID:-}" ]; then
+    detected="kitty"
+  elif [ -n "${ALACRITTY_LOG:-}" ] || [ -n "${ALACRITTY_WINDOW_ID:-}" ] || [ -n "${ALACRITTY_SOCKET:-}" ]; then
+    detected="alacritty"
+  elif [ -n "${GHOSTTY_RESOURCES_DIR:-}" ]; then
+    detected="ghostty"
+  elif [ -n "${FOOT_SERVER_SOCKET_PATH:-}" ]; then
+    detected="foot"
+  fi
+
+  # 2. Check TERM_PROGRAM
+  if [ -z "$detected" ] && [ -n "${TERM_PROGRAM:-}" ]; then
+    local tp="${TERM_PROGRAM,,}"
+    case "$tp" in
+      *kitty*) detected="kitty" ;;
+      *alacritty*) detected="alacritty" ;;
+      *ghostty*) detected="ghostty" ;;
+      *foot*) detected="foot" ;;
+    esac
+  fi
+
+  # 3. Check TERM
+  if [ -z "$detected" ] && [ -n "${TERM:-}" ]; then
+    case "$TERM" in
+      *kitty*) detected="kitty" ;;
+      *alacritty*) detected="alacritty" ;;
+      *ghostty*) detected="ghostty" ;;
+      foot*|*foot*) detected="foot" ;;
+    esac
+  fi
+
+  # 4. Check parent process tree (PPID ancestry)
+  if [ -z "$detected" ]; then
+    local curr_pid="$$"
+    for _ in {1..6}; do
+      curr_pid="$(ps -o ppid= -p "$curr_pid" 2>/dev/null | tr -d ' ' || true)"
+      [ -z "$curr_pid" ] || [ "$curr_pid" -le 1 ] && break
+      local comm
+      comm="$(ps -o comm= -p "$curr_pid" 2>/dev/null | tr -d ' ' || true)"
+      case "${comm,,}" in
+        *kitty*) detected="kitty"; break ;;
+        *alacritty*) detected="alacritty"; break ;;
+        *ghostty*) detected="ghostty"; break ;;
+        *foot*) detected="foot"; break ;;
+      esac
+    done
+  fi
+
+  # 5. Check existing configuration directories as fallback
+  if [ -z "$detected" ]; then
+    if [ -d "${XDG_CONFIG_HOME:-$HOME/.config}/kitty" ]; then
+      detected="kitty"
+    elif [ -d "${XDG_CONFIG_HOME:-$HOME/.config}/alacritty" ]; then
+      detected="alacritty"
+    elif [ -d "${XDG_CONFIG_HOME:-$HOME/.config}/ghostty" ]; then
+      detected="ghostty"
+    elif [ -d "${XDG_CONFIG_HOME:-$HOME/.config}/foot" ]; then
+      detected="foot"
+    else
+      detected="kitty"
+    fi
+  fi
+
+  echo "$detected"
+}
+
+load_adapter() {
+  local term="${1:-}"
+  if [ -z "$term" ]; then
+    term="$(detect_terminal)"
+  fi
+
+  local adapter_script="$ADAPTERS_DIR/${term}.sh"
+  if [ -f "$adapter_script" ]; then
+    # shellcheck source=/dev/null
+    source "$adapter_script"
+    ACTIVE_TERMINAL="$term"
+  else
+    echo -e "${RED}Error:${NC} Terminal adapter '$term' not found in $ADAPTERS_DIR." >&2
+    local available
+    available="$(find "$ADAPTERS_DIR" -name "*.sh" -exec basename {} .sh \; 2>/dev/null | tr '\n' ' ')"
+    echo "Available terminal adapters: ${available:-kitty}" >&2
+    exit 1
+  fi
+}
+
+check_command() {
+  local cmd="$1"
+  local hint="$2"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo -e "${RED}Error:${NC} '$cmd' is not installed or not in your PATH." >&2
+    echo "Hint: $hint" >&2
+    exit 1
+  fi
+}
+
+show_help() {
+  echo -e "${BOLD}voxr${NC} - Unified Terminal Aesthetics Manager (${DIM}v${VERSION}${NC})"
+  echo
+  echo -e "${BOLD}USAGE:${NC}"
+  echo "  voxr [global options] <command> [subcommand] [options]"
+  echo
+  echo -e "${BOLD}COMMANDS:${NC}"
+  echo -e "  ${CYAN}fetch list${NC}                          List available system-info fetch layouts"
+  echo -e "  ${CYAN}fetch preview${NC} <name>                Preview a fetch layout without applying"
+  echo -e "  ${CYAN}color list${NC}                          List available terminal colorschemes"
+  echo -e "  ${CYAN}color preview${NC} <name>                Show color swatches for a colorscheme"
+  echo -e "  ${CYAN}apply --fetch${NC} <f> ${CYAN}--color${NC} <c>       Apply layout and/or colorscheme"
+  echo -e "  ${CYAN}apply --preset${NC} <preset>             Apply a saved layout+colorscheme combo"
+  echo -e "  ${CYAN}backup${NC}                              Back up live fetch config and terminal theme"
+  echo -e "  ${CYAN}restore${NC} [target]                    Restore latest (or specified) backup"
+  echo
+  echo -e "${BOLD}OPTIONS:${NC}"
+  echo "  -t, --terminal <name>               Target terminal (kitty, alacritty, ghostty, foot)"
+  echo "  -h, --help                          Show this help message"
+  echo "  -v, --version                       Show version"
+  echo
+  echo -e "${BOLD}EXAMPLES:${NC}"
+  echo "  voxr fetch list"
+  echo "  voxr fetch preview xsip"
+  echo "  voxr color list"
+  echo "  voxr color preview fern"
+  echo "  voxr apply --fetch tree --color nord"
+  echo "  voxr apply --preset xsip"
+  echo "  voxr apply --color catppuccin --terminal alacritty"
+  echo "  voxr backup"
+  echo "  voxr restore"
+}
+
+# Resolve fetch layout file by name (e.g. "xsip" or "fastfetch/xsip")
+resolve_fetch_layout() {
+  local query="$1"
+  local matched=""
+
+  if [ -f "$FETCHERS_DIR/$query.jsonc" ]; then
+    matched="$FETCHERS_DIR/$query.jsonc"
+  elif [ -f "$FETCHERS_DIR/fastfetch/$query.jsonc" ]; then
+    matched="$FETCHERS_DIR/fastfetch/$query.jsonc"
+  else
+    # Search among all fetchers
+    local found
+    found=$(find "$FETCHERS_DIR" -name "${query}.jsonc" 2>/dev/null | head -n1 || true)
+    if [ -n "$found" ] && [ -f "$found" ]; then
+      matched="$found"
+    fi
+  fi
+
+  echo "$matched"
+}
+
+# Resolve colorscheme file by name (e.g. "fern" or "fern.conf")
+resolve_colorscheme() {
+  local query="$1"
+  local file=""
+
+  if [ -f "$COLORSCHEMES_DIR/$query" ]; then
+    file="$COLORSCHEMES_DIR/$query"
+  elif [ -f "$COLORSCHEMES_DIR/${query}.conf" ]; then
+    file="$COLORSCHEMES_DIR/${query}.conf"
+  fi
+
+  echo "$file"
+}
+
+cmd_fetch_list() {
+  echo -e "${BOLD}Available Fetch Layouts:${NC}\n"
+
+  local count=0
+  for f in "$FETCHERS_DIR"/*/*.jsonc; do
+    [ -f "$f" ] || continue
+    local rel_name
+    rel_name="${f#"$FETCHERS_DIR"/}"
+    rel_name="${rel_name%.jsonc}"
+    
+    local short_name
+    short_name="$(basename "$f" .jsonc)"
+
+    case "$short_name" in
+      xsip)
+        printf "  ${CYAN}%-20s${NC} EndeavourOS minimal layout with cyan accents and OS life tracker\n" "$rel_name"
+        ;;
+      tree)
+        printf "  ${CYAN}%-20s${NC} Hierarchical branch-style structure using ANSI adaptive colors\n" "$rel_name"
+        ;;
+      compact)
+        printf "  ${CYAN}%-20s${NC} Denser single-line summary with ANSI adaptive colors\n" "$rel_name"
+        ;;
+      *)
+        printf "  ${CYAN}%-20s${NC} System-info layout\n" "$rel_name"
+        ;;
+    esac
+    count=$((count + 1))
+  done
+
+  if [ "$count" -eq 0 ]; then
+    echo "  (No fetch layouts found in $FETCHERS_DIR)"
+  else
+    echo
+    echo -e "Preview with: ${CYAN}voxr fetch preview <name>${NC}"
+  fi
+}
+
+cmd_fetch_preview() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    echo -e "${RED}Error:${NC} No layout specified." >&2
+    echo "Usage: voxr fetch preview <name>" >&2
+    echo "Run 'voxr fetch list' to see available layouts." >&2
+    exit 1
+  fi
+
+  check_command "fastfetch" "Install fastfetch via your package manager (e.g. sudo pacman -S fastfetch / sudo dnf install fastfetch)."
+
+  local layout_file
+  layout_file="$(resolve_fetch_layout "$name")"
+
+  if [ -z "$layout_file" ] || [ ! -f "$layout_file" ]; then
+    echo -e "${RED}Error:${NC} Fetch layout '$name' not found." >&2
+    echo "Run 'voxr fetch list' to view available layouts." >&2
+    exit 1
+  fi
+
+  shift || true
+  fastfetch -c "$layout_file" "$@"
+}
+
+cmd_color_list() {
+  echo -e "${BOLD}Available Terminal Colorschemes:${NC}\n"
+
+  local count=0
+  for conf in "$COLORSCHEMES_DIR"/*.conf; do
+    [ -f "$conf" ] || continue
+    local name
+    name="$(basename "$conf" .conf)"
+
+    case "$name" in
+      fern)
+        printf "  ${CYAN}%-16s${NC} Warm, earthy minimalism (sand, mint, ember, deep dark base)\n" "$name"
+        ;;
+      nord)
+        printf "  ${CYAN}%-16s${NC} Arctic icy blue and slate palette from the Nord theme\n" "$name"
+        ;;
+      catppuccin)
+        printf "  ${CYAN}%-16s${NC} Soothing pastel palette from Catppuccin Mocha\n" "$name"
+        ;;
+      *)
+        printf "  ${CYAN}%-16s${NC} 16-color ANSI terminal palette\n" "$name"
+        ;;
+    esac
+    count=$((count + 1))
+  done
+
+  if [ "$count" -eq 0 ]; then
+    echo "  (No colorschemes found in $COLORSCHEMES_DIR)"
+  else
+    echo
+    echo -e "Preview swatches with: ${CYAN}voxr color preview <name>${NC}"
+  fi
+}
+
+cmd_color_preview() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    echo -e "${RED}Error:${NC} No colorscheme specified." >&2
+    echo "Usage: voxr color preview <name>" >&2
+    echo "Run 'voxr color list' to see available colorschemes." >&2
+    exit 1
+  fi
+
+  local scheme_file
+  scheme_file="$(resolve_colorscheme "$name")"
+
+  if [ -z "$scheme_file" ] || [ ! -f "$scheme_file" ]; then
+    echo -e "${RED}Error:${NC} Colorscheme '$name' not found." >&2
+    echo "Run 'voxr color list' to view available colorschemes." >&2
+    exit 1
+  fi
+
+  local scheme_name
+  scheme_name="$(basename "$scheme_file" .conf)"
+
+  echo -e "\n${BOLD}Colorscheme Swatch: ${CYAN}${scheme_name}${NC}\n"
+
+  # Helper to get hex from key in conf file
+  get_hex() {
+    local key="$1"
+    grep -E "^[[:space:]]*$key[[:space:]]+" "$scheme_file" 2>/dev/null \
+      | awk '{print $2}' \
+      | tr -d ' \r\n'
+  }
+
+  print_color_box() {
+    local hex="$1"
+    local label="$2"
+    if [[ "$hex" =~ ^#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})$ ]]; then
+      local r=$((16#${BASH_REMATCH[1]}))
+      local g=$((16#${BASH_REMATCH[2]}))
+      local b=$((16#${BASH_REMATCH[3]}))
+      printf "\033[48;2;%d;%d;%dm   \033[0m %-8s " "$r" "$g" "$b" "$label"
+    else
+      printf " %-11s " "$label"
+    fi
+  }
+
+  local bg fg cur
+  bg="$(get_hex "background")"
+  fg="$(get_hex "foreground")"
+  cur="$(get_hex "cursor")"
+
+  echo -e "  ${DIM}Background:${NC} ${bg:-N/A}   ${DIM}Foreground:${NC} ${fg:-N/A}   ${DIM}Cursor:${NC} ${cur:-N/A}\n"
+
+  echo -e "  ${BOLD}Standard Colors (0-7):${NC}"
+  printf "  "
+  for i in {0..7}; do
+    local h
+    h="$(get_hex "color$i")"
+    print_color_box "$h" "[$i]"
+    [ "$i" -eq 3 ] && printf "\n  "
+  done
+  printf "\n\n"
+
+  echo -e "  ${BOLD}Bright Colors (8-15):${NC}"
+  printf "  "
+  for i in {8..15}; do
+    local h
+    h="$(get_hex "color$i")"
+    print_color_box "$h" "[$i]"
+    [ "$i" -eq 11 ] && printf "\n  "
+  done
+  printf "\n\n"
+
+  echo -e "Apply this palette with: ${CYAN}voxr apply --color ${scheme_name}${NC}\n"
+}
+
+apply_fetch_layout() {
+  local name="$1"
+  check_command "fastfetch" "Please install fastfetch first."
+
+  local layout_file
+  layout_file="$(resolve_fetch_layout "$name")"
+
+  if [ -z "$layout_file" ] || [ ! -f "$layout_file" ]; then
+    echo -e "${RED}Error:${NC} Fetch layout '$name' not found." >&2
+    exit 1
+  fi
+
+  mkdir -p "$FASTFETCH_CONFIG_DIR"
+
+  # Backup live fastfetch config before overwriting
+  if [ -f "$FASTFETCH_LIVE_CONFIG" ]; then
+    local ts
+    ts="$(date +"%Y%m%d_%H%M%S")"
+    mkdir -p "$VOXR_BACKUP_DIR/$ts"
+    cp "$FASTFETCH_LIVE_CONFIG" "$VOXR_BACKUP_DIR/$ts/config.jsonc"
+    echo -e "${YELLOW}Backed up live fetch config:${NC} $VOXR_BACKUP_DIR/$ts/config.jsonc"
+  fi
+
+  cp "$layout_file" "$FASTFETCH_LIVE_CONFIG"
+  echo -e "${GREEN}Fetch layout applied:${NC} $(basename "$layout_file") -> $FASTFETCH_LIVE_CONFIG"
+}
+
+apply_terminal_color() {
+  local name="$1"
+  local target_term="${2:-}"
+
+  [ -n "$target_term" ] && load_adapter "$target_term" || { [ -z "$ACTIVE_TERMINAL" ] && load_adapter; }
+
+  local scheme_file
+  scheme_file="$(resolve_colorscheme "$name")"
+
+  if [ -z "$scheme_file" ] || [ ! -f "$scheme_file" ]; then
+    echo -e "${RED}Error:${NC} Colorscheme '$name' not found." >&2
+    exit 1
+  fi
+
+  # Backup current live theme for active terminal before overwriting
+  local live_theme=""
+  case "$ACTIVE_TERMINAL" in
+    kitty) live_theme="${XDG_CONFIG_HOME:-$HOME/.config}/kitty/current-theme.conf" ;;
+    alacritty) live_theme="${XDG_CONFIG_HOME:-$HOME/.config}/alacritty/current-theme.toml" ;;
+    ghostty) live_theme="${XDG_CONFIG_HOME:-$HOME/.config}/ghostty/current-theme" ;;
+    foot) live_theme="${XDG_CONFIG_HOME:-$HOME/.config}/foot/current-theme.ini" ;;
+  esac
+
+  if [ -n "$live_theme" ] && [ -f "$live_theme" ]; then
+    local ts
+    ts="$(date +"%Y%m%d_%H%M%S")"
+    mkdir -p "$VOXR_BACKUP_DIR/$ts"
+    cp "$live_theme" "$VOXR_BACKUP_DIR/$ts/$(basename "$live_theme")"
+    echo -e "${YELLOW}Backed up live terminal theme:${NC} $VOXR_BACKUP_DIR/$ts/$(basename "$live_theme")"
+  fi
+
+  # Delegate to adapter
+  echo -e "${BOLD}Target terminal:${NC} ${CYAN}${ACTIVE_TERMINAL}${NC}"
+  apply_colors "$scheme_file"
+}
+
+cmd_apply() {
+  local fetch_val=""
+  local color_val=""
+  local preset_val=""
+  local term_val="${TARGET_TERMINAL:-}"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --fetch|-f)
+        fetch_val="${2:-}"
+        shift 2 || true
+        ;;
+      --color|-c)
+        color_val="${2:-}"
+        shift 2 || true
+        ;;
+      --preset|-p)
+        preset_val="${2:-}"
+        shift 2 || true
+        ;;
+      --terminal|-t)
+        term_val="${2:-}"
+        shift 2 || true
+        ;;
+      *)
+        echo -e "${RED}Error:${NC} Unknown option '$1'." >&2
+        echo "Usage: voxr apply [--fetch <layout>] [--color <colorscheme>] [--preset <name>] [--terminal <term>]" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  [ -n "$term_val" ] && load_adapter "$term_val" || load_adapter
+
+  if [ -n "$preset_val" ]; then
+    local preset_file="$PRESETS_DIR/${preset_val}.json"
+    if [ ! -f "$preset_file" ]; then
+      echo -e "${RED}Error:${NC} Preset '$preset_val' not found at $preset_file." >&2
+      exit 1
+    fi
+
+    # Read fetcher and colorscheme from JSON
+    local p_fetch p_color
+    if command -v jq >/dev/null 2>&1; then
+      p_fetch="$(jq -r '.fetcher // empty' "$preset_file")"
+      p_color="$(jq -r '.colorscheme // empty' "$preset_file")"
+    else
+      p_fetch="$(grep -E '"fetcher"[[:space:]]*:' "$preset_file" | sed -E 's/.*"fetcher"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')"
+      p_color="$(grep -E '"colorscheme"[[:space:]]*:' "$preset_file" | sed -E 's/.*"colorscheme"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')"
+    fi
+
+    echo -e "${BOLD}Applying preset:${NC} ${CYAN}${preset_val}${NC} (Layout: $p_fetch, Color: $p_color)"
+    [ -n "$p_fetch" ] && apply_fetch_layout "$p_fetch"
+    [ -n "$p_color" ] && apply_terminal_color "$p_color" "$ACTIVE_TERMINAL"
+    echo -e "${GREEN}Preset '$preset_val' applied successfully!${NC}"
+    return 0
+  fi
+
+  if [ -z "$fetch_val" ] && [ -z "$color_val" ]; then
+    echo -e "${RED}Error:${NC} Nothing to apply." >&2
+    echo "Provide --fetch, --color, or --preset." >&2
+    echo "Example: voxr apply --fetch xsip --color fern" >&2
+    exit 1
+  fi
+
+  [ -n "$fetch_val" ] && apply_fetch_layout "$fetch_val"
+  [ -n "$color_val" ] && apply_terminal_color "$color_val" "$ACTIVE_TERMINAL"
+  echo -e "${GREEN}Configuration updated successfully.${NC}"
+}
+
+cmd_backup() {
+  local ts
+  ts="$(date +"%Y%m%d_%H%M%S")"
+  local backup_path="$VOXR_BACKUP_DIR/$ts"
+  mkdir -p "$backup_path"
+
+  local count=0
+
+  if [ -f "$FASTFETCH_LIVE_CONFIG" ]; then
+    cp "$FASTFETCH_LIVE_CONFIG" "$backup_path/config.jsonc"
+    echo -e "  [x] Backed up fetch config: $FASTFETCH_LIVE_CONFIG"
+    count=$((count + 1))
+  fi
+
+  local kt="${XDG_CONFIG_HOME:-$HOME/.config}/kitty/current-theme.conf"
+  if [ -f "$kt" ]; then
+    cp "$kt" "$backup_path/current-theme.conf"
+    echo -e "  [x] Backed up Kitty theme: $kt"
+    count=$((count + 1))
+  fi
+
+  local at="${XDG_CONFIG_HOME:-$HOME/.config}/alacritty/current-theme.toml"
+  if [ -f "$at" ]; then
+    cp "$at" "$backup_path/current-theme.toml"
+    echo -e "  [x] Backed up Alacritty theme: $at"
+    count=$((count + 1))
+  fi
+
+  local gt="${XDG_CONFIG_HOME:-$HOME/.config}/ghostty/current-theme"
+  if [ -f "$gt" ]; then
+    cp "$gt" "$backup_path/current-theme"
+    echo -e "  [x] Backed up Ghostty theme: $gt"
+    count=$((count + 1))
+  fi
+
+  local ft="${XDG_CONFIG_HOME:-$HOME/.config}/foot/current-theme.ini"
+  if [ -f "$ft" ]; then
+    cp "$ft" "$backup_path/current-theme.ini"
+    echo -e "  [x] Backed up Foot theme: $ft"
+    count=$((count + 1))
+  fi
+
+  if [ "$count" -eq 0 ]; then
+    echo -e "${YELLOW}Warning:${NC} No live configurations found to back up."
+    rmdir "$backup_path" 2>/dev/null || true
+    exit 0
+  fi
+
+  # Update pointer
+  rm -f "$VOXR_BACKUP_DIR/latest"
+  ln -sf "$backup_path" "$VOXR_BACKUP_DIR/latest"
+
+  echo -e "${GREEN}Backup successfully created at:${NC} $backup_path"
+}
+
+cmd_restore() {
+  local target="${1:-}"
+  local restore_path=""
+
+  if [ -n "$target" ]; then
+    if [ -d "$target" ]; then
+      restore_path="$target"
+    elif [ -d "$VOXR_BACKUP_DIR/$target" ]; then
+      restore_path="$VOXR_BACKUP_DIR/$target"
+    else
+      echo -e "${RED}Error:${NC} Specified backup '$target' does not exist." >&2
+      exit 1
+    fi
+  else
+    if [ -d "$VOXR_BACKUP_DIR/latest" ]; then
+      restore_path="$VOXR_BACKUP_DIR/latest"
+    else
+      local newest
+      newest="$(ls -td "$VOXR_BACKUP_DIR"/*/ 2>/dev/null | head -n1 || true)"
+      if [ -n "$newest" ] && [ -d "$newest" ]; then
+        restore_path="${newest%/}"
+      fi
+    fi
+  fi
+
+  if [ -z "$restore_path" ] || [ ! -d "$restore_path" ]; then
+    echo -e "${RED}Error:${NC} No backup found to restore." >&2
+    exit 1
+  fi
+
+  echo -e "${BOLD}Restoring configuration from:${NC} $restore_path"
+
+  # Safety: Take a fresh backup of current live state first
+  local safety_ts
+  safety_ts="$(date +"%Y%m%d_%H%M%S")"
+  local safety_path="$VOXR_BACKUP_DIR/pre_restore_$safety_ts"
+  mkdir -p "$safety_path"
+  [ -f "$FASTFETCH_LIVE_CONFIG" ] && cp "$FASTFETCH_LIVE_CONFIG" "$safety_path/config.jsonc"
+  [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/kitty/current-theme.conf" ] && cp "${XDG_CONFIG_HOME:-$HOME/.config}/kitty/current-theme.conf" "$safety_path/current-theme.conf"
+  [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/alacritty/current-theme.toml" ] && cp "${XDG_CONFIG_HOME:-$HOME/.config}/alacritty/current-theme.toml" "$safety_path/current-theme.toml"
+  [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/ghostty/current-theme" ] && cp "${XDG_CONFIG_HOME:-$HOME/.config}/ghostty/current-theme" "$safety_path/current-theme"
+  [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/foot/current-theme.ini" ] && cp "${XDG_CONFIG_HOME:-$HOME/.config}/foot/current-theme.ini" "$safety_path/current-theme.ini"
+  echo -e "${DIM}Current live config saved to: $safety_path${NC}"
+
+  # Restore fetcher config
+  if [ -f "$restore_path/config.jsonc" ]; then
+    mkdir -p "$FASTFETCH_CONFIG_DIR"
+    cp "$restore_path/config.jsonc" "$FASTFETCH_LIVE_CONFIG"
+    echo -e "  [✓] Restored fetch configuration: $FASTFETCH_LIVE_CONFIG"
+  fi
+
+  # Restore terminal themes
+  if [ -f "$restore_path/current-theme.conf" ]; then
+    load_adapter "kitty"
+    apply_colors "$restore_path/current-theme.conf"
+    echo -e "  [✓] Restored Kitty theme"
+  fi
+  if [ -f "$restore_path/current-theme.toml" ]; then
+    load_adapter "alacritty"
+    apply_colors "$restore_path/current-theme.toml"
+    echo -e "  [✓] Restored Alacritty theme"
+  fi
+  if [ -f "$restore_path/current-theme" ]; then
+    load_adapter "ghostty"
+    apply_colors "$restore_path/current-theme"
+    echo -e "  [✓] Restored Ghostty theme"
+  fi
+  if [ -f "$restore_path/current-theme.ini" ]; then
+    load_adapter "foot"
+    apply_colors "$restore_path/current-theme.ini"
+    echo -e "  [✓] Restored Foot theme"
+  fi
+
+  echo -e "${GREEN}Restore complete!${NC}"
+}
+
+main() {
+  TARGET_TERMINAL=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -t|--terminal)
+        TARGET_TERMINAL="${2:-}"
+        shift 2 || true
+        ;;
+      -h|--help|help)
+        show_help
+        return 0
+        ;;
+      -v|--version|version)
+        echo "voxr version $VERSION (voxr24)"
+        return 0
+        ;;
+      "")
+        show_help
+        return 0
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  local cmd="${1:-}"
+
+  case "$cmd" in
+    fetch)
+      shift
+      local sub="${1:-}"
+      case "$sub" in
+        list|ls)
+          cmd_fetch_list
+          ;;
+        preview|show)
+          shift
+          cmd_fetch_preview "$@"
+          ;;
+        *)
+          echo -e "${RED}Error:${NC} Unknown fetch subcommand '$sub'." >&2
+          echo "Usage: voxr fetch [list|preview <name>]" >&2
+          exit 1
+          ;;
+      esac
+      ;;
+    color)
+      shift
+      local sub="${1:-}"
+      case "$sub" in
+        list|ls)
+          cmd_color_list
+          ;;
+        preview|show)
+          shift
+          cmd_color_preview "$@"
+          ;;
+        *)
+          echo -e "${RED}Error:${NC} Unknown color subcommand '$sub'." >&2
+          echo "Usage: voxr color [list|preview <name>]" >&2
+          exit 1
+          ;;
+      esac
+      ;;
+    apply)
+      shift
+      cmd_apply "$@"
+      ;;
+    backup)
+      cmd_backup
+      ;;
+    restore)
+      shift
+      cmd_restore "$@"
+      ;;
+    *)
+      echo -e "${RED}Error:${NC} Unknown command '$cmd'." >&2
+      echo "Run 'voxr --help' for usage." >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

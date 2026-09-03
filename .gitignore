@@ -1,0 +1,19 @@
+# Makepkg build directories & packages
+src/
+pkg/
+*.pkg.tar.*
+*.log
+
+# Editor & OS temporary files
+.vscode/
+.idea/
+*.swp
+*.bak
+*~
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.tmp
+tests/
+
